@@ -1,0 +1,12 @@
+[package]
+name = "embed-str"
+version = "0.1.0"
+authors = ["Jeong YunWon <jeong@youknowone.org>"]
+edition = "2018"
+description = "Short-string embeding Box<str>"
+license-file = "LICENSE"
+documentation = "https://docs.rs/embed-str/"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
