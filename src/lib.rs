@@ -1,12 +1,19 @@
 //! Short string embedding for std `str`
 
+use std::borrow::Cow;
+use std::mem::{self, MaybeUninit};
+use std::ptr;
+
 /// Replacement of Box<[std::str::str]> for short string embedding
 ///
 /// When string size is smaller than `std::mem::size_of::<usize>*2-1`,
 /// embed the string content into itself rather than holding the pointer.
-pub struct EmbeddingStr([usize; 2]);
+#[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+#[cfg_attr(target_pointer_width = "32", repr(align(4)))]
+pub struct EmbeddingStr(MaybeUninit<[u8; STR_INNER_SIZE]>);
 
-const STR_INNER_SIZE: usize = std::mem::size_of::<EmbeddingStr>();
+const STR_INNER_SIZE: usize = std::mem::size_of::<usize>() * 2;
+const MAX_EMBEDDED_LEN: usize = STR_INNER_SIZE - 1;
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum EmbeddingStrMode {
@@ -15,21 +22,80 @@ pub enum EmbeddingStrMode {
 }
 
 impl EmbeddingStr {
-    pub fn mode(&self) -> EmbeddingStrMode {
-        // SAFETY: std::mem::align_of::<&str>() > 1
-        if (self.0[0] & 1) == 0 {
-            EmbeddingStrMode::Boxed
+    fn new_embedded(s: &str) -> Self {
+        debug_assert!(s.len() <= MAX_EMBEDDED_LEN);
+        let mut new = std::mem::MaybeUninit::uninit();
+        let mut_ptr = new.as_mut_ptr() as *mut u8;
+        let encoded_len = ((s.len() as u8) << 1) | 1;
+        unsafe {
+            if cfg!(target_endian = "little") {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), mut_ptr.add(1), s.len());
+                mut_ptr.write(encoded_len);
+            } else {
+                std::ptr::copy_nonoverlapping(s.as_ptr(), mut_ptr, s.len());
+                mut_ptr.add(STR_INNER_SIZE - 1).write(encoded_len);
+            }
+        }
+        Self(new)
+    }
+
+    fn new_heap(s: Box<str>) -> Self {
+        let len = s.len();
+        let ptr = Box::into_raw(s) as *mut u8 as usize;
+        let (a, b) = if cfg!(target_endian = "little") {
+            (ptr, len)
         } else {
+            (len, ptr)
+        };
+        Self(unsafe { mem::transmute([a, b]) })
+    }
+
+    unsafe fn heap_ptr(&self) -> *const str {
+        let [a, b] = std::mem::transmute_copy::<_, [usize; 2]>(&self.0);
+        let (ptr, len) = if cfg!(target_endian = "little") {
+            (a as *const u8, b)
+        } else {
+            (b as *const u8, a)
+        };
+        ptr::slice_from_raw_parts(ptr, len) as *const str
+    }
+
+    fn embedded_len(&self) -> Option<usize> {
+        // SAFETY: std::mem::align_of::<&str>() > 1
+        let discriminant_byte = unsafe {
+            if cfg!(target_endian = "little") {
+                std::mem::transmute_copy::<_, u8>(&self.0)
+            } else {
+                self.0.as_ptr().cast::<u8>().add(STR_INNER_SIZE - 1).read()
+            }
+        };
+        if discriminant_byte & 1 == 0 {
+            None
+        } else {
+            Some(usize::from(discriminant_byte >> 1))
+        }
+    }
+
+    pub fn mode(&self) -> EmbeddingStrMode {
+        if self.embedded_len().is_some() {
             EmbeddingStrMode::Embedded
+        } else {
+            EmbeddingStrMode::Boxed
         }
     }
 
     pub fn as_str(&self) -> &str {
-        match self.mode() {
-            EmbeddingStrMode::Boxed => unsafe { std::mem::transmute(self.0) },
-            EmbeddingStrMode::Embedded => {
-                let embedded = unsafe { &*(self as *const Self as *const EmbeddedStr) };
-                embedded.as_str()
+        match self.embedded_len() {
+            None => unsafe { &*self.heap_ptr() },
+            Some(len) => {
+                let ptr = self.0.as_ptr().cast::<u8>();
+                let start = if cfg!(target_endian = "little") {
+                    unsafe { ptr.add(1) }
+                } else {
+                    ptr
+                };
+                let sptr = ptr::slice_from_raw_parts(start, len) as *const str;
+                unsafe { &*sptr }
             }
         }
     }
@@ -39,7 +105,7 @@ impl Drop for EmbeddingStr {
     fn drop(&mut self) {
         match self.mode() {
             EmbeddingStrMode::Boxed => {
-                let _boxed: Box<str> = unsafe { std::mem::transmute(self.0) };
+                let _boxed = unsafe { Box::from_raw(self.heap_ptr() as *mut str) };
             }
             EmbeddingStrMode::Embedded => {
                 // nothing to do
@@ -61,75 +127,37 @@ impl std::fmt::Debug for EmbeddingStr {
 }
 
 impl From<String> for EmbeddingStr {
-    #[inline]
+    #[inline(always)]
     fn from(s: String) -> Self {
-        const MAX_SIZE: usize = STR_INNER_SIZE - 1;
-        // when size=0, it already has embedded form
-        Self(if (1..=MAX_SIZE).contains(&s.len()) {
-            let embedded = EmbeddedStr::from(s.as_str());
-            unsafe { std::mem::transmute(embedded) }
-        } else {
-            let boxed = s.into_boxed_str();
-            unsafe { std::mem::transmute(boxed) }
-        })
+        Self::from(Cow::Owned(s))
     }
 }
 
-impl From<&'static str> for EmbeddingStr {
-    #[inline]
+impl From<&'_ str> for EmbeddingStr {
+    #[inline(always)]
     fn from(s: &str) -> Self {
-        const MAX_SIZE: usize = STR_INNER_SIZE - 1;
-        // when size=0, it already has embedded form
-        Self(if (1..=MAX_SIZE).contains(&s.len()) {
-            let embedded = EmbeddedStr::from(s);
-            unsafe { std::mem::transmute(embedded) }
-        } else {
-            let boxed = s.to_owned().into_boxed_str();
-            unsafe { std::mem::transmute(boxed) }
-        })
+        EmbeddingStr::from(Cow::Borrowed(s))
     }
 }
 
-struct EmbeddedStr([u8; STR_INNER_SIZE]);
-
-impl EmbeddedStr {
-    fn as_str(&self) -> &str {
-        let ptr;
-        let encoded_len;
-        #[cfg(target_endian = "little")]
-        unsafe {
-            ptr = self.0.as_ptr().offset(1);
-            encoded_len = (*self.0.as_ptr()) as usize;
-        }
-        #[cfg(target_endian = "big")]
-        unsafe {
-            ptr = self.0.as_ptr();
-            encoded_len = *self.0.as_ptr().offset(STR_INNER_SIZE - 1);
-        }
-        let pair = [ptr as usize, encoded_len as usize >> 1];
-        unsafe { std::mem::transmute(pair) }
-    }
-}
-
-impl From<&str> for EmbeddedStr {
+impl From<Cow<'_, str>> for EmbeddingStr {
     #[inline]
-    fn from(s: &str) -> Self {
-        debug_assert!(s.len() < STR_INNER_SIZE);
-        let mut new = std::mem::MaybeUninit::<Self>::uninit();
-        let mut_ptr = new.as_mut_ptr() as *mut u8;
-        let encoded_len = (s.len() << 1) as u8 + 1;
-        unsafe {
-            #[cfg(target_endian = "little")]
-            {
-                std::ptr::copy_nonoverlapping(s.as_ptr(), mut_ptr.offset(1), s.len());
-                mut_ptr.write(encoded_len);
-            }
-            #[cfg(target_endian = "big")]
-            {
-                std::ptr::copy_nonoverlapping(s.as_ptr(), mut_ptr, s.len());
-                mut_ptr.offset(MAX_SIZE).write(encoded_len);
-            }
-            new.assume_init()
+    fn from(s: Cow<'_, str>) -> Self {
+        if s.len() <= MAX_EMBEDDED_LEN {
+            Self::new_embedded(&s)
+        } else {
+            Self::new_heap(s.into_owned().into_boxed_str())
+        }
+    }
+}
+
+impl From<Box<str>> for EmbeddingStr {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        if s.len() <= MAX_EMBEDDED_LEN {
+            Self::new_embedded(&s)
+        } else {
+            Self::new_heap(s)
         }
     }
 }
