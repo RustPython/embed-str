@@ -12,6 +12,22 @@ use std::ptr;
 #[cfg_attr(target_pointer_width = "32", repr(align(4)))]
 pub struct EmbeddingStr(MaybeUninit<[u8; STR_INNER_SIZE]>);
 
+// Little Endian 32 bit:
+// heap : |x|l|l|l|p|p|p|p|
+// embed: |x|s|s|s|s|s|s|s|
+// Big Endian 32 bit:
+// heap : |p|p|p|p|l|l|l|x|
+// embed: |s|s|s|s|s|s|s|x|
+//
+// x: discriminant byte; the first bit is 1 if embedded and 0 if heap, the rest of the
+// byte is the len<<1
+// l: the rest of the len<<1 if heap
+// p: ptr to data if heap
+// s: str data (1 utf8 byte) if embedded
+//
+// we can shift the len<<1 because the max slice len is actually isize::MAX as usize:
+// https://stackoverflow.com/questions/32324794/maximum-size-of-an-array-in-32-bits
+
 const STR_INNER_SIZE: usize = std::mem::size_of::<usize>() * 2;
 const MAX_EMBEDDED_LEN: usize = STR_INNER_SIZE - 1;
 
@@ -19,6 +35,15 @@ const MAX_EMBEDDED_LEN: usize = STR_INNER_SIZE - 1;
 pub enum EmbeddingStrMode {
     Boxed,
     Embedded,
+}
+
+#[inline]
+fn len_least_significant([len, ptr]: [usize; 2]) -> [usize; 2] {
+    if cfg!(target_endian = "little") {
+        [len, ptr]
+    } else {
+        [ptr, len]
+    }
 }
 
 impl EmbeddingStr {
@@ -42,26 +67,19 @@ impl EmbeddingStr {
     fn new_heap(s: Box<str>) -> Self {
         let len = s.len();
         let ptr = Box::into_raw(s) as *mut u8 as usize;
-        let (a, b) = if cfg!(target_endian = "little") {
-            (ptr, len)
-        } else {
-            (len, ptr)
-        };
-        Self(unsafe { mem::transmute([a, b]) })
+        let inner = len_least_significant([len << 1, ptr]);
+        Self(unsafe { mem::transmute(inner) })
     }
 
+    // SAFETY: must be in fully initialized heap mode to call
     unsafe fn heap_ptr(&self) -> *const str {
-        let [a, b] = std::mem::transmute_copy::<_, [usize; 2]>(&self.0);
-        let (ptr, len) = if cfg!(target_endian = "little") {
-            (a as *const u8, b)
-        } else {
-            (b as *const u8, a)
-        };
-        ptr::slice_from_raw_parts(ptr, len) as *const str
+        let inner = mem::transmute_copy(&self.0);
+        let [len, ptr] = len_least_significant(inner);
+        ptr::slice_from_raw_parts(ptr as *const u8, len >> 1) as *const str
     }
 
     fn embedded_len(&self) -> Option<usize> {
-        // SAFETY: std::mem::align_of::<&str>() > 1
+        // SAFETY: the least significant byte of the structure is always initialized
         let discriminant_byte = unsafe {
             if cfg!(target_endian = "little") {
                 std::mem::transmute_copy::<_, u8>(&self.0)
